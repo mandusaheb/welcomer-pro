@@ -1,4 +1,11 @@
-require('dotenv').config();
+// load .env in local/dev only — won't crash in production if dotenv isn't installed
+try {
+  require('dotenv').config();
+} catch (e) {
+  // dotenv not installed (ok on Railway). You can optionally log here.
+  // console.log('dotenv not found — using environment variables from host.');
+}
+
 
 // index.js
 // Discord.js v14 bot that:
@@ -384,4 +391,5 @@ client.on(Events.MessageCreate, async (message) => {
 client.login(TOKEN).catch(err => {
   console.error('Login failed. Ensure TOKEN is set. Error:', err);
 });
+
 
