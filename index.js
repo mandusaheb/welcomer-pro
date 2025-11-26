@@ -1,21 +1,14 @@
-// index.js - Fully updated welcome bot
-// - Safe env loading
-// - Robust welcome flow (image, continue -> animation -> 3 choices)
-// - Only the joining member can press Continue/choices (others get ephemeral reply)
-// - Professional chart generation and sent as attachment to owner (fallback to channel)
-// - Includes !ping, !status, !testwelcome for debugging/testing
+// index.js
+// Two-page welcomer: immediate image -> Q1 (Friend / Discord / Other[modal]) -> Next -> Q2 (info) -> Confirm -> DM + chart
+// Requirements: discord.js v14, node-fetch@2, jimp (optional if you change images), dotenv (optional)
+// Env: TOKEN, WELCOME_CHANNEL_ID, OWNER_ID, (optional) WELCOME_ROLE_NAME
 
-// Load env (Railway-safe)
-try {
-  require('dotenv').config();
-} catch (e) {
-  // dotenv optional on platforms like Railway
-}
+// Safe dotenv (won't crash on Railway)
+try { require('dotenv').config(); } catch (e) {}
 
 // Imports
 const fs = require('fs');
 const path = require('path');
-const Jimp = require('jimp');
 const fetch = require('node-fetch'); // v2
 const {
   Client,
@@ -26,38 +19,37 @@ const {
   ButtonBuilder,
   ButtonStyle,
   Events,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  InteractionType,
   AttachmentBuilder
 } = require('discord.js');
 
-// Environment variables (no defaults for security)
+// Environment (set these in Railway)
 const TOKEN = process.env.TOKEN;
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID;
 const OWNER_ID = process.env.OWNER_ID;
+const WELCOME_ROLE_NAME = process.env.WELCOME_ROLE_NAME || 'FAMILY MEMBERS';
 
 console.log('TOKEN Loaded:', !!TOKEN);
 console.log('WELCOME_CHANNEL_ID Loaded:', !!WELCOME_CHANNEL_ID);
 console.log('OWNER_ID Loaded:', !!OWNER_ID);
+console.log('WELCOME_ROLE_NAME:', WELCOME_ROLE_NAME);
 
-// Local assets & storage
-const LOCAL_BG_PATH = '/mnt/data/brave_screenshot_github.com.png'; // your uploaded image path
-const REMOTE_FALLBACK_BG = 'https://i.imgur.com/8Km9tLL.png'; // fallback public image
+// Paths & storage
+const LOCAL_IMAGE_PATH = '/mnt/data/Screenshot 2025-10-16 224418.png'; // the exact image you uploaded
 const STORAGE_FILE = path.join(__dirname, 'engagement_counts.json');
 
-// Ensure storage file exists
+// Ensure storage
 if (!fs.existsSync(STORAGE_FILE)) {
-  fs.writeFileSync(
-    STORAGE_FILE,
-    JSON.stringify({ choices: { 'Discord Search': 0, 'Friend Invite': 0, 'Social Media': 0 } }, null, 2)
-  );
+  fs.writeFileSync(STORAGE_FILE, JSON.stringify({ choices: {} }, null, 2));
 }
+function readCounts(){ return JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8')); }
+function writeCounts(d){ fs.writeFileSync(STORAGE_FILE, JSON.stringify(d, null, 2)); }
 
-// Helpers for counts
-function readCounts() {
-  return JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
-}
-function writeCounts(data) {
-  fs.writeFileSync(STORAGE_FILE, JSON.stringify(data, null, 2));
-}
+// In-memory session (short-lived)
+const sessions = {}; // sessions[memberId] = { q1: null, q1raw:null, page:1, messageId, channelId }
 
 // Create client
 const client = new Client({
@@ -71,354 +63,437 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// Ready log
+// ready
 client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag} (id: ${client.user.id})`);
 });
 
-// ========== Image builder ==========
-// Build a polished welcome image: blurred bg, rounded card, avatar, title, subtitle, footer
-async function makeWelcomeImage(memberLike) {
-  // memberLike must have .user (username, displayAvatarURL) and .member (displayName) optionally
-  let bg;
-  try {
-    if (fs.existsSync(LOCAL_BG_PATH)) {
-      console.log('Using local background image:', LOCAL_BG_PATH);
-      bg = await Jimp.read(LOCAL_BG_PATH);
-    } else {
-      console.warn('Local background missing; fetching remote fallback:', REMOTE_FALLBACK_BG);
-      const res = await fetch(REMOTE_FALLBACK_BG);
-      const buffer = await res.buffer();
-      bg = await Jimp.read(buffer);
-    }
-  } catch (err) {
-    console.error('Failed to load background image; using solid fallback:', err);
-    bg = new Jimp(1200, 675, 0x0a0a0aFF); // dark fallback
-  }
-
-  const width = 1200;
-  const height = 675;
-  bg.cover(width, height);
-
-  const blurred = bg.clone().blur(10).brightness(-0.07);
-
-  const cardW = 980;
-  const cardH = 360;
-  const cardX = Math.floor((width - cardW) / 2);
-  const cardY = Math.floor((height - cardH) / 2);
-
-  // Create card and border
-  const card = new Jimp(cardW, cardH, 0x0e0e0eff);
-  const border = new Jimp(cardW + 8, cardH + 8, 0x1f6febff);
-
-  // Composite border then card
-  blurred.composite(border, cardX - 4, cardY - 4);
-  blurred.composite(card, cardX, cardY);
-
-  // Avatar handling
-  try {
-    const avatarUrl = memberLike.user.displayAvatarURL({ format: 'png', size: 256 });
-    const avatarImg = await Jimp.read(avatarUrl);
-    avatarImg.cover(160, 160);
-
-    // circular mask for avatar
-    const avatarMask = new Jimp(160, 160, 0x00000000);
-    avatarMask.scan(0, 0, 160, 160, function (x, y, idx) {
-      const cx = 80, cy = 80;
-      const dist = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
-      avatarMask.bitmap.data[idx + 3] = dist <= 78 ? 255 : 0;
-    });
-
-    const avaX = cardX + 30;
-    const avaY = cardY + Math.floor((cardH - 160) / 2);
-    const avaBg = new Jimp(176, 176, 0x0a1117FF);
-    blurred.composite(avaBg, avaX - 8, avaY - 8);
-    avatarImg.mask(avatarMask, 0, 0);
-    blurred.composite(avatarImg, avaX, avaY);
-  } catch (err) {
-    console.warn('Could not load user avatar; continuing without avatar:', err);
-  }
-
-  // Fonts & text
-  try {
-    const fontTitle = await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE);
-    const fontSub = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
-    const fontSmall = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
-
-    const textStartX = cardX + 220;
-    const titleY = cardY + 40;
-    const subY = cardY + 120;
-    const footerY = cardY + cardH - 40;
-
-    // Title (no emoji)
-    const titleText = 'Cosmic Gate';
-    blurred.print(fontTitle, textStartX, titleY, titleText);
-
-    // Use displayName if available
-    const displayName =
-      memberLike.member && memberLike.member.displayName
-        ? memberLike.member.displayName
-        : memberLike.user && memberLike.user.username
-        ? memberLike.user.username
-        : `User`;
-
-    const subtitle = `Welcome, ${displayName}! A watcher of the stars greets you.`;
-    blurred.print(fontSub, textStartX, subY, { text: subtitle, alignmentX: Jimp.HORIZONTAL_ALIGN_LEFT }, cardW - 260);
-    blurred.print(fontSmall, textStartX, footerY, 'The stars remember your arrival');
-  } catch (err) {
-    console.warn('Font load/print failed, continuing without text:', err);
-  }
-
-  const outPath = path.join(__dirname, `welcome_${Date.now()}.png`);
-  await blurred.quality(90).writeAsync(outPath);
-  return outPath;
-}
-
-// Animation and chart helpers
-const ANIMATION_GIF_URL = 'https://media.giphy.com/media/3o7aCSPqXE5C6T8tBC/giphy.gif';
-
-// Generate a professional chart image buffer using QuickChart and return buffer
+// Helper: build professional QuickChart and return buffer
 async function buildChartBuffer(countsObj, lastChoiceLabel, whoTag) {
   const labels = Object.keys(countsObj);
-  const data = labels.map((l) => countsObj[l]);
-
+  const data = labels.map(l => countsObj[l]);
   const chartConfig = {
     type: 'bar',
     data: {
       labels,
-      datasets: [
-        {
-          label: 'New members',
-          data,
-          backgroundColor: ['rgba(54,162,235,0.95)', 'rgba(75,192,192,0.95)', 'rgba(153,102,255,0.95)'],
-          borderRadius: 8,
-          barPercentage: 0.6
-        }
-      ]
+      datasets: [{
+        label: 'New members',
+        data,
+        backgroundColor: ['rgba(54,162,235,0.95)','rgba(75,192,192,0.95)','rgba(153,102,255,0.95)'],
+        borderRadius: 8,
+        barPercentage: 0.6
+      }]
     },
     options: {
-      layout: { padding: 12 },
-      plugins: {
-        title: { display: true, text: 'Where members discover the server', font: { size: 18 } },
-        subtitle: { display: true, text: `Last: ${lastChoiceLabel} — by ${whoTag}`, font: { size: 12 } },
-        legend: { display: false }
+      layout:{ padding:12 },
+      plugins:{
+        title:{ display:true, text:'Where members discover the server', font:{ size:18 } },
+        subtitle:{ display:true, text:`Last: ${lastChoiceLabel} — by ${whoTag}`, font:{ size:12 } },
+        legend:{ display:false }
       },
-      scales: {
-        x: { grid: { display: false }, ticks: { color: '#ffffff' } },
-        y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.06)' }, ticks: { color: '#ffffff', stepSize: 1 } }
+      scales:{
+        x:{ grid:{ display:false } },
+        y:{ beginAtZero:true, grid:{ color:'rgba(255,255,255,0.06)' }, ticks:{ stepSize:1 } }
       },
       backgroundColor: '#0b0b0d'
     }
   };
-
-  const qcUrl = `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}&w=1000&h=550&format=png&version=3`;
-
+  const qcUrl = `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}&w=1000&h=500&format=png&version=3`;
   const res = await fetch(qcUrl);
   if (!res.ok) throw new Error(`Chart fetch failed: ${res.status}`);
-  const buffer = await res.buffer();
-  return buffer;
+  return await res.buffer();
 }
 
-// Send professional chart to owner (attachment). Fallback to posting in the welcome channel.
-async function makeProfessionalChartAndSend(countsObj, lastChoiceLabel, whoTag, guild) {
+// Helper: send chart to owner (DM) or fallback to welcome channel
+async function sendChartToOwner(countsObj, lastChoiceLabel, whoTag, guild) {
   try {
     const buffer = await buildChartBuffer(countsObj, lastChoiceLabel, whoTag);
-    const attachment = new AttachmentBuilder(buffer, { name: 'engagement_chart.png' });
-
-    // Try DM owner
+    const att = new AttachmentBuilder(buffer, { name: 'engagement_chart.png' });
     try {
       const owner = await client.users.fetch(OWNER_ID);
       if (owner) {
-        await owner.send({ content: `New choice recorded: **${lastChoiceLabel}** (by ${whoTag})`, files: [attachment] });
+        await owner.send({ content: `New answer recorded: **${lastChoiceLabel}** (by ${whoTag}). Latest engagement:`, files: [att] });
         return;
       }
     } catch (err) {
-      console.warn('Could not DM owner; will fallback to channel.', err);
+      console.warn('Could not DM owner, falling back to channel:', err);
     }
-
-    // fallback to posting in guild channel
+    // fallback
     try {
       const ch = guild.channels.cache.get(WELCOME_CHANNEL_ID);
-      if (ch) {
-        await ch.send({ content: `Latest engagement chart:`, files: [attachment] });
-      }
+      if (ch) await ch.send({ content: 'Latest engagement chart:', files: [att] });
     } catch (err) {
-      console.error('Failed to post chart to welcome channel:', err);
+      console.error('Fallback chart post failed:', err);
     }
   } catch (err) {
-    console.error('makeProfessionalChartAndSend error:', err);
+    console.error('sendChartToOwner error:', err);
   }
 }
 
-// Shared welcome flow (used by member join and !testwelcome)
-async function runWelcomeFlowFor(memberLike) {
+// Build the page 1 embed + components (Next disabled unless answered)
+function buildPage1Embed(memberId, selectedLabel = null) {
+  const embed = new EmbedBuilder()
+    .setTitle('Question 1 of 2 — Where did you find us?')
+    .setDescription('Choose one option below. If you select **Other**, you will be asked to type where.')
+    .setColor(0x0b69ff);
+
+  // Buttons: Friend, Discord, Other (Other opens modal)
+  const btnFriend = new ButtonBuilder().setCustomId(`q1_friend_${memberId}`).setLabel('Friend').setStyle(ButtonStyle.Secondary);
+  const btnDiscord = new ButtonBuilder().setCustomId(`q1_discord_${memberId}`).setLabel('Discord').setStyle(ButtonStyle.Primary);
+  const btnOther = new ButtonBuilder().setCustomId(`q1_other_${memberId}`).setLabel('Other').setStyle(ButtonStyle.Success);
+
+  // Next — disabled if not selected
+  const nextBtn = new ButtonBuilder().setCustomId(`q1_next_${memberId}`).setLabel('Next →').setStyle(ButtonStyle.Primary).setDisabled(!selectedLabel);
+
+  const row1 = new ActionRowBuilder().addComponents(btnFriend, btnDiscord, btnOther);
+  const row2 = new ActionRowBuilder().addComponents(nextBtn);
+
+  return { embed, components: [row1, row2] };
+}
+
+// Build the page 2 embed + confirm button
+function buildPage2Embed(memberId, q1Label) {
+  const embed = new EmbedBuilder()
+    .setTitle('Question 2 of 2 — About this channel')
+    .setDescription(
+      `This server focuses on **Cosmos Esports** — competitive gaming, events, and community.  
+- 🎮 Tournaments & scrims  
+- 🧠 Guides & coaching  
+- 💬 Chill zone & team recruiting  
+
+Your selection: **${q1Label}**. Click **Confirm** when you are ready.`
+    )
+    .setColor(0x0b69ff);
+
+  const confirmBtn = new ButtonBuilder().setCustomId(`q2_confirm_${memberId}`).setLabel('Confirm').setStyle(ButtonStyle.Success);
+  const row = new ActionRowBuilder().addComponents(confirmBtn);
+  return { embed, components: [row] };
+}
+
+// Run welcome flow on a member-like object (member or fake for !testwelcome)
+async function startWelcomeFor(memberLike) {
   try {
     const channel = memberLike.guild.channels.cache.get(WELCOME_CHANNEL_ID);
     if (!channel) {
-      console.error('Welcome channel not found or bot missing permission. WELCOME_CHANNEL_ID:', WELCOME_CHANNEL_ID);
+      console.error('Invalid WELCOME_CHANNEL_ID or missing permissions:', WELCOME_CHANNEL_ID);
       return { ok: false, reason: 'invalid_channel' };
     }
 
-    const imagePath = await makeWelcomeImage(memberLike);
-    const continueBtn = new ButtonBuilder().setCustomId(`welcome_continue_${memberLike.id}_${Date.now()}`).setLabel('Continue').setStyle(ButtonStyle.Primary);
-    const row = new ActionRowBuilder().addComponents(continueBtn);
+    // 1) Send the provided image immediately
+    let sentImageMsg;
+    try {
+      if (fs.existsSync(LOCAL_IMAGE_PATH)) {
+        const attachment = new AttachmentBuilder(fs.readFileSync(LOCAL_IMAGE_PATH), { name: 'welcome.png' });
+        sentImageMsg = await channel.send({ files: [attachment] });
+      } else {
+        // If image missing, send a fallback embed instead
+        await channel.send({ embeds: [ new EmbedBuilder().setTitle('Welcome to Cosmos Esports').setDescription('Welcome!').setColor(0x0b0b0b) ] });
+      }
+    } catch (err) {
+      console.error('Failed to send welcome image:', err);
+    }
 
-    await channel.send({ content: `<@${memberLike.id}>`, files: [imagePath], components: [row] });
+    // 2) Initialize session state
+    sessions[memberLike.id] = { q1: null, q1raw: null, page: 1, messageId: null, channelId: channel.id };
 
-    // cleanup
-    setTimeout(() => {
-      try { fs.unlinkSync(imagePath); } catch (e) {}
-    }, 60_000);
-
-    return { ok: true };
+    // 3) Send Page 1 (question embed + buttons)
+    const { embed, components } = buildPage1Embed(memberLike.id, null);
+    const sent = await channel.send({ content: `<@${memberLike.id}>`, embeds: [embed], components });
+    sessions[memberLike.id].messageId = sent.id;
+    return { ok: true, message: sent };
   } catch (err) {
-    console.error('runWelcomeFlowFor error:', err);
+    console.error('startWelcomeFor error:', err);
     return { ok: false, reason: 'error', error: err };
   }
 }
 
-// On new member join
+// When a new guild member joins
 client.on(Events.GuildMemberAdd, async (member) => {
-  console.log('GuildMemberAdd fired for:', member.user.tag, member.id);
-  const res = await runWelcomeFlowFor(member);
-  if (!res.ok) console.warn('Welcome flow failed for new member:', res);
+  console.log('GuildMemberAdd:', member.user.tag, member.id);
+  await startWelcomeFor(member);
 });
 
-// Interaction handler (robust extraction + ephemeral replies)
+// Interaction handling: buttons + modal submits
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    // Modal submit (Other)
+    if (interaction.type === InteractionType.ModalSubmit) {
+      const customId = interaction.customId; // format: modal_other_<memberId>
+      const mMatch = customId.match(/^modal_other_(\d+)$/);
+      if (mMatch) {
+        const targetId = mMatch[1];
+        if (interaction.user.id !== targetId) {
+          await interaction.reply({ content: 'This modal is not for you.', ephemeral: true });
+          return;
+        }
+        const otherField = interaction.fields.getTextInputValue('other_input'); // text input id below
+        // store in session
+        if (!sessions[targetId]) sessions[targetId] = { q1: null, q1raw: null, page: 1 };
+        sessions[targetId].q1 = 'Other';
+        sessions[targetId].q1raw = otherField;
+        // enable Next by editing the original message components
+        try {
+          const ch = interaction.guild.channels.cache.get(sessions[targetId].channelId);
+          if (ch && sessions[targetId].messageId) {
+            const msg = await ch.messages.fetch(sessions[targetId].messageId).catch(()=>null);
+            if (msg) {
+              const { embed, components } = buildPage1Embed(targetId, 'Other');
+              await msg.edit({ embeds: [embed], components });
+            }
+          }
+        } catch (err) {
+          console.warn('Failed to enable Next after modal:', err);
+        }
+        await interaction.reply({ content: 'Thanks — your answer has been recorded. Click Next to continue.', ephemeral: true });
+        return;
+      }
+    }
+
     if (!interaction.isButton()) return;
 
     const id = interaction.customId;
 
-    // Continue button
-    const continueMatch = id.match(/^welcome_continue_(\d+)_\d+$/);
-    if (continueMatch) {
-      const targetMemberId = continueMatch[1];
-
-      if (interaction.user.id !== targetMemberId) {
-        await interaction.reply({ content: "This Continue button is only for the new member — you can't use it.", ephemeral: true });
+    // q1 friend or discord or other
+    const q1Match = id.match(/^q1_(friend|discord|other)_(\d+)$/);
+    if (q1Match) {
+      const choice = q1Match[1] === 'friend' ? 'Friend' : (q1Match[1] === 'discord' ? 'Discord' : 'Other');
+      const memberId = q1Match[2];
+      if (interaction.user.id !== memberId) {
+        await interaction.reply({ content: "This question is for the new member only.", ephemeral: true });
         return;
       }
 
-      // update to animation
-      await interaction.update({
-        content: `<@${targetMemberId}>`,
-        embeds: [ new EmbedBuilder().setTitle('✨ A cosmic greeting...').setDescription('Preparing the stars...').setImage(ANIMATION_GIF_URL) ],
-        components: []
-      });
+      // store session
+      if (!sessions[memberId]) sessions[memberId] = { q1: null, q1raw: null, page: 1 };
+      sessions[memberId].q1 = choice;
+      if (choice !== 'Other') sessions[memberId].q1raw = choice;
 
-      // after delay show options
-      setTimeout(async () => {
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`choice_${targetMemberId}_Discord Search`).setLabel('Discord Search').setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId(`choice_${targetMemberId}_Friend Invite`).setLabel('Friend Invite').setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId(`choice_${targetMemberId}_Social Media`).setLabel('Social Media').setStyle(ButtonStyle.Primary)
-        );
-
+      if (choice === 'Other') {
+        // show modal to type other platform
+        const modal = new ModalBuilder().setCustomId(`modal_other_${memberId}`).setTitle('Which platform did you find us on?');
+        const input = new TextInputBuilder().setCustomId('other_input').setLabel('Type the platform (e.g. Instagram, Twitter, Reddit)').setStyle(TextInputStyle.Short).setPlaceholder('Instagram, Reddit, etc.').setRequired(true);
+        const row = new ActionRowBuilder().addComponents(input);
+        modal.addComponents(row);
+        await interaction.showModal(modal);
+        return;
+      } else {
+        // enable Next by editing message
         try {
-          await interaction.message.edit({
-            content: `<@${targetMemberId}>`,
-            embeds: [ new EmbedBuilder().setTitle('Tell us how you found us').setDescription('Choose one option below:') ],
-            components: [ row ]
-          });
-        } catch (err) {
-          try {
-            await interaction.followUp({
-              content: `<@${targetMemberId}>`,
-              embeds: [ new EmbedBuilder().setTitle('Tell us how you found us').setDescription('Choose one option below:') ],
-              components: [ row ]
-            });
-          } catch (err2) {
-            console.error('Failed to present choices:', err2);
+          const ch = interaction.guild.channels.cache.get(sessions[memberId].channelId);
+          const msg = ch ? await ch.messages.fetch(sessions[memberId].messageId).catch(()=>null) : null;
+          if (msg) {
+            const { embed, components } = buildPage1Embed(memberId, sessions[memberId].q1);
+            await msg.edit({ embeds: [embed], components });
           }
+        } catch (err) {
+          console.warn('Failed to update message after q1 choice:', err);
         }
-      }, 2200);
+        await interaction.reply({ content: `You selected **${sessions[memberId].q1}**. Click Next to continue.`, ephemeral: true });
+        return;
+      }
+    }
 
+    // Next button
+    const nextMatch = id.match(/^q1_next_(\d+)$/);
+    if (nextMatch) {
+      const memberId = nextMatch[1];
+      if (interaction.user.id !== memberId) {
+        await interaction.reply({ content: 'This Next button is only for the joining member.', ephemeral: true });
+        return;
+      }
+      // Ensure answered
+      if (!sessions[memberId] || !sessions[memberId].q1) {
+        await interaction.reply({ content: 'Please answer the question first.', ephemeral: true });
+        return;
+      }
+
+      // Move to page 2: edit message to page 2 embed
+      try {
+        const ch = interaction.guild.channels.cache.get(sessions[memberId].channelId);
+        const msg = ch ? await ch.messages.fetch(sessions[memberId].messageId).catch(()=>null) : null;
+        if (msg) {
+          const q1Label = sessions[memberId].q1raw || sessions[memberId].q1;
+          const { embed, components } = buildPage2Embed(memberId, q1Label);
+          await msg.edit({ embeds: [embed], components });
+          sessions[memberId].page = 2;
+        }
+      } catch (err) {
+        console.error('Failed to present page 2:', err);
+      }
+      await interaction.reply({ content: 'Moving to the next question...', ephemeral: true });
       return;
     }
 
-    // Choice buttons
-    const choiceMatch = id.match(/^choice_(\d+)_(.+)$/);
-    if (choiceMatch) {
-      const memberId = choiceMatch[1];
-      const chosenLabel = choiceMatch[2];
-
+    // Confirm on page 2
+    const confirmMatch = id.match(/^q2_confirm_(\d+)$/);
+    if (confirmMatch) {
+      const memberId = confirmMatch[1];
       if (interaction.user.id !== memberId) {
-        await interaction.reply({ content: "This choice isn't for you.", ephemeral: true });
+        await interaction.reply({ content: 'This Confirm button is only for the joining member.', ephemeral: true });
         return;
       }
+
+      // finalize: record answer -> JSON, send DM, update message to final
+      const q1Label = sessions[memberId] ? (sessions[memberId].q1raw || sessions[memberId].q1) : 'Unknown';
 
       // update counts
-      const store = readCounts();
-      if (!store.choices[chosenLabel]) store.choices[chosenLabel] = 0;
-      store.choices[chosenLabel]++;
-      writeCounts(store);
-
-      // ack user
-      await interaction.update({
-        content: `<@${memberId}>`,
-        embeds: [ new EmbedBuilder().setTitle('Thanks!').setDescription(`You chose: **${chosenLabel}**`) ],
-        components: []
-      });
-
-      // send chart to owner (attachment)
       try {
-        await makeProfessionalChartAndSend(store.choices, chosenLabel, interaction.user.tag, interaction.guild);
+        const store = readCounts();
+        if (!store.choices[q1Label]) store.choices[q1Label] = 0;
+        store.choices[q1Label]++;
+        writeCounts(store);
       } catch (err) {
-        console.error('Failed to generate/send chart:', err);
+        console.error('Failed to update counts:', err);
       }
 
+      // send a super-cool tech DM
+      try {
+        const dmEmbed = new EmbedBuilder()
+          .setTitle('Welcome to Cosmos Esports — Mission Accepted 🚀')
+          .setDescription(
+            'Hey — welcome aboard! We just initialized your onboarding sequence and registered your response. ' +
+            'We’re a fast, competitive community — expect events, coaching, and a squad-ready vibe.\n\n' +
+            '**Quick tips:**\n• Use `#events` for tournaments\n• Use `#find-teammates` to recruit\n• Read `#rules` to stay safe\n\nSee you in the arena — Commander.\n`> connection established — enjoy the cosmos`'
+          )
+          .setColor(0x00ffcc)
+          .setFooter({ text: 'Cosmos Esports • Dominate the cosmos' })
+          .setTimestamp();
+
+        // small animated GIF link for tech effect
+        const gifUrl = 'https://media.giphy.com/media/3oEjI6SIIHBdRxXI40/giphy.gif';
+        await interaction.user.send({ embeds: [dmEmbed], files: [], content: `✨ PERSONAL WELCOME — ${interaction.user.username}` }).catch(()=>{});
+        // send second message with small tech gif (non-blocking)
+        try { await interaction.user.send({ content: 'Welcome packet:', files: [gifUrl] }).catch(()=>{}); } catch {}
+      } catch (err) {
+        console.warn('Could not DM user (DMs might be closed):', err);
+      }
+
+      // edit original message to final small thanks embed
+      try {
+        const ch = interaction.guild.channels.cache.get(sessions[memberId].channelId);
+        const msg = ch ? await ch.messages.fetch(sessions[memberId].messageId).catch(()=>null) : null;
+        if (msg) {
+          const doneEmbed = new EmbedBuilder().setTitle('Thanks!').setDescription(`You selected **${q1Label}**. Welcome!`).setColor(0x22bb33);
+          await msg.edit({ content: `<@${memberId}>`, embeds: [doneEmbed], components: [] });
+        }
+      } catch (err) {
+        console.warn('Failed to edit to final message:', err);
+      }
+
+      // send chart to owner
+      try {
+        const store = readCounts();
+        await sendChartToOwner(store.choices, q1Label, interaction.user.tag, interaction.guild);
+      } catch (err) {
+        console.error('Failed sending chart to owner:', err);
+      }
+
+      // optionally assign role if WELCOME_ROLE_NAME exists (uncomment if desired)
+      try {
+        if (WELCOME_ROLE_NAME) {
+          const guildMember = await interaction.guild.members.fetch(memberId).catch(()=>null);
+          if (guildMember) {
+            const role = interaction.guild.roles.cache.find(r => r.name === WELCOME_ROLE_NAME);
+            if (role) {
+              await guildMember.roles.add(role).catch(err => console.warn('Role add failed:', err));
+            } else {
+              console.warn('Role not found:', WELCOME_ROLE_NAME);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Role assignment exception:', err);
+      }
+
+      // cleanup session after short delay
+      setTimeout(()=>{ delete sessions[memberId]; }, 5 * 60 * 1000);
+
+      // reply ephemeral confirming finalization
+      try { if (!interaction.replied) await interaction.reply({ content: 'Onboarding complete — welcome!', ephemeral: true }); } catch {}
+
       return;
     }
+
   } catch (err) {
-    console.error('InteractionCreate handler error:', err);
-    try { if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'There was an error handling your interaction.', ephemeral: true }); } catch {}
+    console.error('InteractionCreate error:', err);
+    try { if (!interaction.replied) await interaction.reply({ content: 'There was an error handling that action.', ephemeral: true }); } catch {}
   }
 });
 
-// Message commands: !ping, !status, !testwelcome
+// For convenience: allow manual testing via !testwelcome
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
-  const content = message.content.trim().toLowerCase();
-
-  if (content === '!ping') {
-    try { await message.reply('Pong!'); } catch (err) { console.error('!ping reply failed:', err); }
-    return;
+  const c = message.content.trim().toLowerCase();
+  if (c === '!ping') {
+    try { await message.reply('Pong!'); } catch (e) {}
   }
-
-  if (content === '!status') {
-    try { await message.reply(`Bot: ${client.user ? client.user.tag : 'not ready'}, Guilds: ${client.guilds.cache.size}`); } catch (err) { console.error('!status reply failed:', err); }
-    return;
+  if (c === '!status') {
+    try { await message.reply(`Bot: ${client.user ? client.user.tag : 'not ready'}, Guilds: ${client.guilds.cache.size}`); } catch (e) {}
   }
-
-  if (content === '!testwelcome') {
-    if (!message.guild) {
-      message.reply('This command must be used in a server channel.');
-      return;
-    }
+  if (c === '!testwelcome') {
+    if (!message.guild) { message.reply('Use this inside a server channel.'); return; }
     try {
-      console.log('!testwelcome invoked by', message.author.tag);
-      const fakeMember = { id: message.author.id, user: message.author, member: message.member, guild: message.guild };
-      const res = await runWelcomeFlowFor(fakeMember);
-      if (!res.ok) message.reply('Test welcome failed (check logs).');
-      else message.reply('Test welcome sent to the configured welcome channel.');
+      const fake = { id: message.author.id, user: message.author, member: message.member, guild: message.guild };
+      const res = await startWelcomeFor(fake); // small helper
+      if (!res || !res.ok) {
+        // fallback to startWelcomeFor (we implemented start in startWelcomeFor name earlier)
+        const r = await startWelcomeFor(fake);
+        if (!r.ok) message.reply('Test welcome failed (see logs).'); else message.reply('Test welcome sent to the welcome channel.');
+      } else {
+        message.reply('Test welcome sent to the welcome channel.');
+      }
     } catch (err) {
-      console.error('!testwelcome failed:', err);
-      try { message.reply('Test welcome encountered an error (see logs).'); } catch {}
+      console.error('!testwelcome error:', err);
+      try { message.reply('Test welcome failed (see logs).'); } catch {}
     }
-    return;
   }
 });
+
+// Note: startWelcomeFor is identical to startWelcomeFor used earlier but we used startWelcomeFor name
+// we must ensure that function exists - alias it to startWelcomeFor used above
+async function startWelcomeFor(memberLike) { return await startWelcomeForCore(memberLike); }
+
+// Implementation of core start function (alias - to avoid duplicate function name issue)
+async function startWelcomeForCore(memberLike) {
+  // reuse startWelcomeFor implemented above - but because of function naming duplication in this single-file, implement here
+  try {
+    const channel = memberLike.guild.channels.cache.get(WELCOME_CHANNEL_ID);
+    if (!channel) {
+      console.error('Invalid WELCOME_CHANNEL_ID or missing permissions:', WELCOME_CHANNEL_ID);
+      return { ok: false, reason: 'invalid_channel' };
+    }
+
+    // send image
+    try {
+      if (fs.existsSync(LOCAL_IMAGE_PATH)) {
+        const attachment = new AttachmentBuilder(fs.readFileSync(LOCAL_IMAGE_PATH), { name: 'welcome.png' });
+        await channel.send({ files: [attachment] });
+      } else {
+        await channel.send({ embeds: [ new EmbedBuilder().setTitle('Welcome to Cosmos Esports').setDescription('Welcome!').setColor(0x0b0b0b) ] });
+      }
+    } catch (err) {
+      console.error('Failed to send image in startWelcomeForCore:', err);
+    }
+
+    sessions[memberLike.id] = { q1: null, q1raw: null, page: 1, messageId: null, channelId: channel.id };
+
+    const { embed, components } = buildPage1Embed(memberLike.id, null);
+    const sent = await channel.send({ content: `<@${memberLike.id}>`, embeds: [embed], components });
+    sessions[memberLike.id].messageId = sent.id;
+    return { ok: true, message: sent };
+  } catch (err) {
+    console.error('startWelcomeForCore error:', err);
+    return { ok: false, reason: 'error', error: err };
+  }
+}
 
 // Login
 if (!TOKEN) {
   console.error('Missing TOKEN environment variable. Set TOKEN in Railway variables and redeploy.');
 } else {
-  client.login(TOKEN).catch((err) => {
-    console.error('Bot login failed. Check TOKEN in Railway → Variables.', err);
+  client.login(TOKEN).catch(err => {
+    console.error('Login failed:', err);
   });
 }
-
 
 
