@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 // index.js
 // Discord.js v14 bot that:
 // 1) On guildMemberAdd: creates a blurred-background welcome image (from local upload),
@@ -382,3 +384,4 @@ client.on(Events.MessageCreate, async (message) => {
 client.login(TOKEN).catch(err => {
   console.error('Login failed. Ensure TOKEN is set. Error:', err);
 });
+
