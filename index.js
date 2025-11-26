@@ -72,6 +72,11 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
+// Add a ready handler so you can see when the bot connected
+client.once(Events.ClientReady, () => {
+  console.log(`Logged in as ${client.user.tag} (id: ${client.user.id})`);
+});
+
 // Build welcome image using Jimp
 async function makeWelcomeImage(memberTag) {
   const bg = await Jimp.read(LOCAL_BG_PATH);
@@ -126,94 +131,6 @@ function makeChartUrl(countsObj) {
 client.on(Events.GuildMemberAdd, async (member) => {
   try {
     const channel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
-    if (!channel) return console.warn('Invalid WELCOME_CHANNEL_ID');
-
-    const welcomeImagePath = await makeWelcomeImage(`${member.user.username}#${member.user.discriminator}`);
-
-    const continueBtn = new ButtonBuilder().setCustomId(`welcome_continue_${member.id}_${Date.now()}`).setLabel('Continue').setStyle(ButtonStyle.Primary);
-    const row = new ActionRowBuilder().addComponents(continueBtn);
-
-    await channel.send({ content: `<@${member.id}>`, files: [welcomeImagePath], components: [row] });
-
-    setTimeout(() => { try { fs.unlinkSync(welcomeImagePath); } catch (e) {} }, 60_000);
-  } catch (err) {
-    console.error('Error in GuildMemberAdd handler:', err);
-  }
-});
-
-// Interaction handling
-client.on(Events.InteractionCreate, async (interaction) => {
-  try {
-    if (!interaction.isButton()) return;
-
-    const id = interaction.customId;
-
-    if (id.startsWith('welcome_continue_')) {
-      const parts = id.split('_');
-      const targetMemberId = parts[2];
-      if (interaction.user.id !== targetMemberId) return interaction.reply({ content: "This isn't for you.", ephemeral: true });
-
-      await interaction.update({
-        content: `<@${targetMemberId}>`,
-        embeds: [new EmbedBuilder().setTitle('✨ A cosmic greeting...').setDescription('Hold on while the stars arrange themselves.').setImage(ANIMATION_GIF_URL)],
-        components: []
-      });
-
-      setTimeout(async () => {
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`choice_${targetMemberId}_Discord Search`).setLabel('Discord Search').setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId(`choice_${targetMemberId}_Friend Invite`).setLabel('Friend Invite').setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId(`choice_${targetMemberId}_Social Media`).setLabel('Social Media').setStyle(ButtonStyle.Primary)
-        );
-
-        try {
-          await interaction.message.edit({ content: `<@${targetMemberId}>`, embeds: [new EmbedBuilder().setTitle('Tell us how you found us').setDescription('Choose one option below:')], components: [row] });
-        } catch (e) {
-          try { await interaction.followUp({ content: `<@${targetMemberId}>`, embeds: [new EmbedBuilder().setTitle('Tell us how you found us').setDescription('Choose one option below:')], components: [row] }); } catch (err) { console.error('Failed to present choices:', err); }
-        }
-      }, 2500);
-
-      return;
-    }
-
-    if (id.startsWith('choice_')) {
-      const match = id.match(/^choice_([^_]+)_(.+)$/);
-      if (!match) return;
-      const memberId = match[1];
-      const chosenLabel = match[2];
-      if (interaction.user.id !== memberId) return interaction.reply({ content: "This isn't for you.", ephemeral: true });
-
-      const store = readCounts();
-      if (!store.choices[chosenLabel]) store.choices[chosenLabel] = 0;
-      store.choices[chosenLabel]++;
-      writeCounts(store);
-
-      await interaction.update({ content: `<@${memberId}>`, embeds: [new EmbedBuilder().setTitle('Thanks!').setDescription(`You chose: **${chosenLabel}**`)], components: [] });
-
-      const url = makeChartUrl(store.choices);
-      const owner = await client.users.fetch(OWNER_ID).catch(() => null);
-      if (owner) {
-        owner.send({ content: `New member chose **${chosenLabel}**`, embeds: [new EmbedBuilder().setTitle('Engagement Chart').setImage(url)] }).catch(() => {});
-      }
-      return;
-    }
-  } catch (e) {
-    console.error('InteractionCreate handler error:', e);
-    try { if (!interaction.deferred && !interaction.replied) await interaction.reply({ content: 'There was an error handling that action.', ephemeral: true }); } catch {}
-  }
-});
-
-// Message ping
-client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot) return;
-  if (message.content.trim().toLowerCase() === '!ping') {
-    try { await message.reply('Pong!'); } catch (e) {}
-  }
-});
-
-// Login
-client.login(TOKEN).catch((err) => {
-  console.error('Bot login failed. Check TOKEN in Railway → Variables.', err);
-});
+    if (!channel) return console.warn('Invalid WELCOME_C_
 
 
